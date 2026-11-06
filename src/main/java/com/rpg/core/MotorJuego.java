@@ -1,5 +1,7 @@
 package com.rpg.core;
 
+import com.rpg.concurrency.AutoGuardadoDaemon;
+import com.rpg.concurrency.GestorTurno;
 import com.rpg.entities.Enemigo;
 import com.rpg.entities.EstadoEfecto;
 import com.rpg.entities.Gremio;
@@ -12,36 +14,70 @@ import com.rpg.entities.enums.TipoEfecto;
 import com.rpg.exceptions.CapacidadExcedidaException;
 import com.rpg.items.Inventario;
 import com.rpg.items.Pocion;
+import com.rpg.persistencia.DatosPartida;
+import com.rpg.persistencia.RepositorioPartida;
 
+import java.io.File;
+import java.io.FileNotFoundException;
+import java.io.IOException;
 import java.util.List;
 import java.util.Random;
+import java.io.NotSerializableException;
 
 /** Coordina el flujo del juego: crear heroe, combatir, torneo, bestiario y guardado. */
 public class MotorJuego {
 
     private static final String NOMBRE_GREMIO = "Guardianes del Alba";
     private static final int CURACION_POCION_VIDA = 30;
+    private static final int SEGUNDOS_TURNO = 10;
+    private static final long INTERVALO_AUTOGUARDADO_MS = 30_000L;
+    private static final String CARPETA_PARTIDAS = "partidas";
+    private static final String ARCHIVO_LOG = "combates.log";
 
     private final Consola consola;
     private final RegistroCombate registro = new RegistroCombate();
     private final Arena arena = new Arena(registro, new Random());
     private final Bestiario bestiario = new Bestiario();
-    private final PerfilJugador perfil = new PerfilJugador();
-    private final Gremio gremio = new Gremio(NOMBRE_GREMIO);
     private final TorneoManager torneo = new TorneoManager(arena, registro);
-    // TALLER ARCHIVOS: ultimoGuardado es solo el estado de la partida en memoria. Aqui (o en un metodo
-    // nuevo como cargarProgreso) iria la carga de una partida guardada en disco; llamala desde Main.
-    private String ultimoGuardado = "";
+    private final GestorTurno gestorTurno = new GestorTurno();
+    private final RepositorioPartida repositorio = new RepositorioPartida(CARPETA_PARTIDAS);
+    private final Object candadoGuardado = new Object();
+
+    // Sin final: al cargar una partida estos dos objetos se reemplazan por los leidos del disco
+    private PerfilJugador perfil = new PerfilJugador();
+    private Gremio gremio = new Gremio(NOMBRE_GREMIO);
+
+    private volatile boolean tiempoAgotado;
+    private volatile String ultimoGuardado = "";
 
     public MotorJuego(Consola consola) {
         this.consola = consola;
     }
 
+    public void iniciarAutoGuardado() {
+        Thread hilo = new Thread(
+                new AutoGuardadoDaemon(INTERVALO_AUTOGUARDADO_MS, () -> guardar(false)), "auto-guardado");
+        hilo.setDaemon(true); // siempre ANTES de start(), si no lanza IllegalThreadStateException
+        hilo.start();
+    }
+
     // ---- opciones del menu principal
 
     public void combateRapido() {
+        combatirCon(crearJugador());
+    }
+
+    /** El heroe viene de la BD: solo falta el kit y el gremio. */
+    public void combateRapidoConHeroe(Personaje jugador) {
+        entregarKitInicial(jugador);
+        jugador.unirseAGremio(gremio);
+        System.out.printf("%s se une al gremio %s (%d miembros).%n",
+                jugador.getNombre(), gremio.getNombre(), gremio.getMiembros().size());
+        combatirCon(jugador);
+    }
+
+    private void combatirCon(Personaje jugador) {
         registro.limpiar();
-        Personaje jugador = crearJugador();
         Enemigo enemigo = elegirEnemigo();
         registro.agregar("%n=== %s vs %s ===", jugador.getNombre(), enemigo.getNombre());
 
@@ -64,6 +100,68 @@ public class MotorJuego {
         System.out.print(bestiario.describir());
         System.out.printf("Victorias: %d | Derrotas: %d | Logros: %s%n",
                 perfil.getVictorias(), perfil.getDerrotas(), perfil.getLogros());
+    }
+
+    // ---- archivos: cargar, listar, historial, borrar
+
+    public void cargarProgreso() {
+        try {
+            DatosPartida datos = repositorio.cargarObjeto("partida.dat");
+            synchronized (candadoGuardado) {
+                perfil = datos.getPerfil();
+                gremio = datos.getGremio();
+                bestiario.setDerrotados(datos.getDerrotados());
+            }
+            System.out.printf("Partida cargada (%s): %d victorias, %d derrotas, %d miembros en el gremio.%n",
+                    datos.getFecha(), perfil.getVictorias(), perfil.getDerrotas(), gremio.getMiembros().size());
+        } catch (FileNotFoundException e) {
+            System.out.println("No hay ninguna partida guardada todavia.");
+        } catch (IOException | ClassNotFoundException e) {
+            System.out.println("No se pudo cargar la partida: " + e.getMessage());
+        }
+    }
+
+    public void listarArchivos() {
+        List<File> archivos = repositorio.listar();
+        if (archivos.isEmpty()) {
+            System.out.println("No hay archivos guardados.");
+            return;
+        }
+        System.out.println("\n=== ARCHIVOS GUARDADOS ===");
+        for (File archivo : archivos) {
+            System.out.printf("  %-20s %7d bytes%n", archivo.getName(), archivo.length());
+        }
+    }
+
+    public void verHistorial() {
+        try {
+            String texto = RegistroCombate.leerArchivo(repositorio.archivo(ARCHIVO_LOG));
+            System.out.println(texto.isBlank() ? "El historial esta vacio." : texto);
+        } catch (FileNotFoundException e) {
+            System.out.println("Todavia no hay historial de combates.");
+        } catch (IOException e) {
+            System.out.println("No se pudo leer el historial: " + e.getMessage());
+        }
+    }
+
+    public void borrarArchivo() {
+        List<File> archivos = repositorio.listar();
+        if (archivos.isEmpty()) {
+            System.out.println("No hay archivos para borrar.");
+            return;
+        }
+        for (int i = 0; i < archivos.size(); i++) {
+            System.out.printf("  %d. %s%n", i + 1, archivos.get(i).getName());
+        }
+        int eleccion = consola.leerEntero("Archivo a borrar (0 = cancelar): ", 0, archivos.size());
+        if (eleccion == 0) {
+            return;
+        }
+        File elegido = archivos.get(eleccion - 1);
+        String confirmacion = consola.leerLinea("Borrar " + elegido.getName() + "? (s/n): ");
+        if (confirmacion.equalsIgnoreCase("s")) {
+            System.out.println(repositorio.borrar(elegido.getName()) ? "Archivo borrado." : "No se pudo borrar.");
+        }
     }
 
     // ---- creacion de personajes
@@ -159,6 +257,10 @@ public class MotorJuego {
                 }
                 case ESPECIAL -> arena.intentarEspecial(jugador, enemigo);
                 case POCION -> usarPocion(jugador);
+                case TIEMPO_AGOTADO -> {
+                    registro.agregar("%s pierde el turno por tardar demasiado.", jugador.getNombre());
+                    yield true;
+                }
                 default -> {
                     mostrarEstado(jugador);
                     yield false;
@@ -168,14 +270,20 @@ public class MotorJuego {
         return false;
     }
 
-    /**
-     * Pide la accion al jugador y se queda esperando hasta que escriba algo.
-     */
+    /** Pide la accion con un limite de tiempo: si se agota, el turno se pierde. */
     private Accion pedirAccion() {
-        // TALLER CONCURRENCIA: esta lectura bloquea el programa sin limite de tiempo.
-        // Aqui debe entrar el temporizador de turno con su callback.
+        tiempoAgotado = false;
+        gestorTurno.iniciar(SEGUNDOS_TURNO, () -> {
+            tiempoAgotado = true;
+            System.out.println("\n>> Tiempo agotado! Escribe una opcion valida para continuar.");
+        });
+        System.out.printf("Tienes %d segundos.%n", SEGUNDOS_TURNO);
         System.out.println("1. Atacar  2. Habilidad especial  3. Usar pocion  4. Ver estado  0. Huir");
         int opcion = consola.leerEntero("Accion: ", 0, 4);
+        gestorTurno.cancelar(); // respondio: se interrumpe el hilo del temporizador
+        if (tiempoAgotado) {
+            return Accion.TIEMPO_AGOTADO;
+        }
         return switch (opcion) {
             case 1 -> Accion.ATACAR;
             case 2 -> Accion.ESPECIAL;
@@ -216,6 +324,8 @@ public class MotorJuego {
     // ---- resultado del combate
 
     private void cerrarCombate(Personaje jugador, Enemigo enemigo, boolean huyo) {
+        jugador.detenerEfectos();
+        enemigo.detenerEfectos();
         if (huyo) {
             registro.agregar("%s huye del combate.", jugador.getNombre());
         } else if (jugador.estaVivo()) {
@@ -252,26 +362,50 @@ public class MotorJuego {
 
     // ---- guardado
 
-    /**
-     * Guarda las estadisticas en memoria (el texto queda en {@code ultimoGuardado}); aun no se escribe ningun
-     * archivo. Hoy solo se invoca al terminar una pelea.
-     */
+    /** Guardado manual: escribe partida.txt / partida.dat y agrega el combate al historial. */
     public void guardarProgreso() {
-        // TALLER ARCHIVOS: ademas de dejar el texto en memoria, escribe la partida en disco (por ejemplo un
-        // .txt con BufferedWriter, y/o un .dat serializando el estado con ObjectOutputStream). Usa try-with-resources.
-        // TALLER CONCURRENCIA: este guardado es manual. Debera hacerse solo, de fondo, mientras se juega.
-        StringBuilder contenido = new StringBuilder();
-        contenido.append("=== PARTIDA RPG ===").append(System.lineSeparator());
-        contenido.append("Victorias: ").append(perfil.getVictorias()).append(System.lineSeparator());
-        contenido.append("Derrotas: ").append(perfil.getDerrotas()).append(System.lineSeparator());
-        contenido.append("Logros: ").append(String.join(", ", perfil.getLogros())).append(System.lineSeparator());
-        contenido.append("Gremio ").append(gremio.getNombre()).append(": ")
-                .append(gremio.getMiembros().size()).append(" miembros").append(System.lineSeparator());
-        contenido.append("Enemigos derrotados: ").append(bestiario.resumenDerrotados()).append(System.lineSeparator());
-        contenido.append(System.lineSeparator()).append("--- Ultimo combate ---").append(System.lineSeparator());
-        contenido.append(registro.getTexto());
-        ultimoGuardado = contenido.toString();
-        System.out.println("[Progreso guardado en memoria]");
+        guardar(true);
+        try {
+            registro.volcarAArchivo(repositorio.archivo(ARCHIVO_LOG), true);
+        } catch (IOException e) {
+            System.out.println("[Error al guardar el historial] " + e.getMessage());
+        }
+    }
+
+    /** @param manual true = partida.*, false = autoguardado.* (asi el auto-guardado no pisa tu partida) */
+    private void guardar(boolean manual) {
+        boolean enDisco;
+        synchronized (candadoGuardado) {
+            StringBuilder contenido = new StringBuilder();
+            contenido.append("=== PARTIDA RPG ===").append(System.lineSeparator());
+            contenido.append("Victorias: ").append(perfil.getVictorias()).append(System.lineSeparator());
+            contenido.append("Derrotas: ").append(perfil.getDerrotas()).append(System.lineSeparator());
+            contenido.append("Logros: ").append(String.join(", ", perfil.getLogros())).append(System.lineSeparator());
+            contenido.append("Gremio ").append(gremio.getNombre()).append(": ")
+                    .append(gremio.getMiembros().size()).append(" miembros").append(System.lineSeparator());
+            contenido.append("Enemigos derrotados: ").append(bestiario.resumenDerrotados()).append(System.lineSeparator());
+            contenido.append(System.lineSeparator()).append("--- Ultimo combate ---").append(System.lineSeparator());
+            contenido.append(registro.getTexto());
+            ultimoGuardado = contenido.toString();
+            enDisco = escribirEnDisco(manual ? "partida" : "autoguardado");
+        }
+        if (manual && enDisco) {
+            System.out.println("[Progreso guardado en memoria y en disco]");
+        }
+    }
+
+    private boolean escribirEnDisco(String base) {
+        try {
+            repositorio.escribirTexto(base + ".txt", ultimoGuardado, false);
+            repositorio.guardarObjeto(base + ".dat", new DatosPartida(perfil, gremio, bestiario.getDerrotados()));
+            return true;
+        } catch (NotSerializableException e) {
+            System.out.println("[Error al guardar] la clase " + e.getMessage() + " no es Serializable.");
+            return false;
+        } catch (IOException e) {
+            System.out.println("[Error al guardar] " + e.getMessage());
+            return false;
+        }
     }
 
     public String getUltimoGuardado() {

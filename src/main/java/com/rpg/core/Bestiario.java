@@ -68,4 +68,15 @@ public class Bestiario {
         }
         return derrotados.toString();
     }
+
+    // ---- persistencia: solo los contadores de derrotas cambian durante el juego
+
+    public Map<String, Integer> getDerrotados() {
+        return new LinkedHashMap<>(derrotados);
+    }
+
+    public void setDerrotados(Map<String, Integer> nuevos) {
+        derrotados.clear();
+        derrotados.putAll(nuevos);
+    }
 }

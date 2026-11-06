@@ -21,13 +21,32 @@ public class TorneoManager {
     /** @return el campeon del torneo */
     public Personaje jugarTorneo() {
         List<Personaje> gladiadores = crearGladiadores().getMiembros();
+        Personaje[] finalistas = new Personaje[2]; // memoria compartida: cada hilo escribe su casilla
 
-        // TALLER CONCURRENCIA: las dos semifinales se simulan una tras otra en el hilo principal.
-        // La final solo puede empezar cuando ambas hayan terminado.
-        Personaje finalista1 = simularSemifinal(gladiadores.get(0), gladiadores.get(1));
-        Personaje finalista2 = simularSemifinal(gladiadores.get(2), gladiadores.get(3));
+        Thread semifinalA = new Thread(
+                () -> finalistas[0] = simularSemifinal(gladiadores.get(0), gladiadores.get(1)), "semifinal-A");
+        Thread semifinalB = new Thread(
+                () -> finalistas[1] = simularSemifinal(gladiadores.get(2), gladiadores.get(3)), "semifinal-B");
 
-        return simularFinal(finalista1, finalista2);
+        System.out.printf("Estado antes de start(): A=%s B=%s%n", semifinalA.getState(), semifinalB.getState());
+        semifinalA.start();
+        semifinalB.start();
+        System.out.printf("Estado despues de start(): A=%s B=%s%n", semifinalA.getState(), semifinalB.getState());
+
+        try {
+            semifinalA.join();
+            semifinalB.join();
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new IllegalStateException("Torneo interrumpido mientras esperaba las semifinales", e);
+        }
+        System.out.printf("Estado despues de join(): A=%s B=%s%n", semifinalA.getState(), semifinalB.getState());
+
+        // Solo ahora es seguro leer los ganadores: join() garantiza que ambos hilos terminaron
+        if (finalistas[0] == null || finalistas[1] == null) {
+            throw new IllegalStateException("Una semifinal fallo y no hay finalista");
+        }
+        return simularFinal(finalistas[0], finalistas[1]);
     }
 
     public Personaje simularSemifinal(Personaje a, Personaje b) {

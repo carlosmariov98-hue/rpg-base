@@ -8,7 +8,9 @@ import java.util.List;
 
 /** Contenedor generico con capacidad limitada: Inventario&lt;Pocion&gt; solo acepta pociones. */
 // TALLER ARCHIVOS: debe volverse Serializable; ademas, los elementos T (hoy Pocion) tambien lo necesitan.
-public class Inventario<T> implements Iterable<T> {
+public class Inventario<T> implements Iterable<T>, java.io.Serializable {
+    private static final long serialVersionUID = 1L;
+
 
     private final List<T> elementos = new ArrayList<>();
     private final int capacidad;
